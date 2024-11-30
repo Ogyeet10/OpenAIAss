@@ -35,7 +35,7 @@ final public class OpenAI: OpenAIProtocol {
     }
     
     private let session: URLSessionProtocol
-    private var streamingSessions: [NSObject] = []
+    private var streamingSessions = ArrayWithThreadSafety<NSObject>()
     
     public let configuration: Configuration
 
@@ -55,13 +55,63 @@ final public class OpenAI: OpenAIProtocol {
     public convenience init(configuration: Configuration, session: URLSession = URLSession.shared) {
         self.init(configuration: configuration, session: session as URLSessionProtocol)
     }
+
+    // UPDATES FROM 11-06-23
+    public func threadsAddMessage(threadId: String, query: MessageQuery, completion: @escaping (Result<ThreadAddMessageResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<ThreadsMessagesResult>(body: query, url: buildRunsURL(path: .threadsMessages, threadId: threadId)), completion: completion)
+    }
+
+    public func threadsMessages(threadId: String, before: String? = nil, completion: @escaping (Result<ThreadsMessagesResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<ThreadsMessagesResult>(body: nil, url: buildRunsURL(path: .threadsMessages, threadId: threadId, before: before), method: "GET"), completion: completion)
+    }
+
+    public func runRetrieve(threadId: String, runId: String, completion: @escaping (Result<RunResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<RunResult>(body: nil, url: buildRunRetrieveURL(path: .runRetrieve, threadId: threadId, runId: runId), method: "GET"), completion: completion)
+    }
+
+    public func runRetrieveSteps(threadId: String, runId: String, before: String? = nil, completion: @escaping (Result<RunRetrieveStepsResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<RunRetrieveStepsResult>(body: nil, url: buildRunRetrieveURL(path: .runRetrieveSteps, threadId: threadId, runId: runId, before: before), method: "GET"), completion: completion)
+    }
     
+    public func runSubmitToolOutputs(threadId: String, runId: String, query: RunToolOutputsQuery, completion: @escaping (Result<RunResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<RunResult>(body: query, url: buildURL(path: .runSubmitToolOutputs(threadId: threadId, runId: runId)), method: "POST"), completion: completion)
+    }
+
+    public func runs(threadId: String, query: RunsQuery, completion: @escaping (Result<RunResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<RunResult>(body: query, url: buildRunsURL(path: .runs, threadId: threadId)), completion: completion)
+    }
+
+    public func threads(query: ThreadsQuery, completion: @escaping (Result<ThreadsResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<ThreadsResult>(body: query, url: buildURL(path: .threads)), completion: completion)
+    }
+    
+    public func threadRun(query: ThreadRunQuery, completion: @escaping (Result<RunResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<RunResult>(body: query, url: buildURL(path: .threadRun)), completion: completion)
+    }
+
+    public func assistants(after: String? = nil, completion: @escaping (Result<AssistantsResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<AssistantsResult>(url: buildURL(path: .assistants, after: after), method: "GET"), completion: completion)
+    }
+
+    public func assistantCreate(query: AssistantsQuery, completion: @escaping (Result<AssistantResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<AssistantsResult>(body: query, url: buildURL(path: .assistants), method: "POST"), completion: completion)
+    }
+
+    public func assistantModify(query: AssistantsQuery, assistantId: String, completion: @escaping (Result<AssistantResult, Error>) -> Void) {
+        performRequest(request: JSONRequest<AssistantsResult>(body: query, url: buildAssistantURL(path: .assistantsModify, assistantId: assistantId), method: "POST"), completion: completion)
+    }
+
+    public func files(query: FilesQuery, completion: @escaping (Result<FilesResult, Error>) -> Void) {
+        performRequest(request: MultipartFormDataRequest<FilesResult>(body: query, url: buildURL(path: .files)), completion: completion)
+    }
+    // END UPDATES FROM 11-06-23
+
     public func completions(query: CompletionsQuery, completion: @escaping (Result<CompletionsResult, Error>) -> Void) {
         performRequest(request: JSONRequest<CompletionsResult>(body: query, url: buildURL(path: .completions)), completion: completion)
     }
     
     public func completionsStream(query: CompletionsQuery, onResult: @escaping (Result<CompletionsResult, Error>) -> Void, completion: ((Error?) -> Void)?) {
-        performSteamingRequest(request: JSONRequest<CompletionsResult>(body: query.makeStreamable(), url: buildURL(path: .completions)), onResult: onResult, completion: completion)
+        performStreamingRequest(request: JSONRequest<CompletionsResult>(body: query.makeStreamable(), url: buildURL(path: .completions)), onResult: onResult, completion: completion)
     }
     
     public func images(query: ImagesQuery, completion: @escaping (Result<ImagesResult, Error>) -> Void) {
@@ -85,7 +135,7 @@ final public class OpenAI: OpenAIProtocol {
     }
     
     public func chatsStream(query: ChatQuery, onResult: @escaping (Result<ChatStreamResult, Error>) -> Void, completion: ((Error?) -> Void)?) {
-        performSteamingRequest(request: JSONRequest<ChatResult>(body: query.makeStreamable(), url: buildURL(path: .chats)), onResult: onResult, completion: completion)
+        performStreamingRequest(request: JSONRequest<ChatStreamResult>(body: query.makeStreamable(), url: buildURL(path: .chats)), onResult: onResult, completion: completion)
     }
     
     public func edits(query: EditsQuery, completion: @escaping (Result<EditsResult, Error>) -> Void) {
@@ -100,6 +150,7 @@ final public class OpenAI: OpenAIProtocol {
         performRequest(request: JSONRequest<ModelsResult>(url: buildURL(path: .models), method: "GET"), completion: completion)
     }
     
+    @available(iOS 13.0, *)
     public func moderations(query: ModerationsQuery, completion: @escaping (Result<ModerationsResult, Error>) -> Void) {
         performRequest(request: JSONRequest<ModerationsResult>(body: query, url: buildURL(path: .moderations)), completion: completion)
     }
@@ -127,29 +178,16 @@ extension OpenAI {
                                             timeoutInterval: configuration.timeoutInterval)
             let task = session.dataTask(with: request) { data, _, error in
                 if let error = error {
-                    completion(.failure(error))
-                    return
+                    return completion(.failure(error))
                 }
                 guard let data = data else {
-                    completion(.failure(OpenAIError.emptyData))
-                    return
+                    return completion(.failure(OpenAIError.emptyData))
                 }
-
-                var apiError: Error? = nil
+                let decoder = JSONDecoder()
                 do {
-                    let decoded = try JSONDecoder().decode(ResultType.self, from: data)
-                    completion(.success(decoded))
+                    completion(.success(try decoder.decode(ResultType.self, from: data)))
                 } catch {
-                    apiError = error
-                }
-
-                if let apiError = apiError {
-                    do {
-                        let decoded = try JSONDecoder().decode(APIErrorResponse.self, from: data)
-                        completion(.failure(decoded))
-                    } catch {
-                        completion(.failure(apiError))
-                    }
+                    completion(.failure((try? decoder.decode(APIErrorResponse.self, from: data)) ?? error))
                 }
             }
             task.resume()
@@ -158,7 +196,7 @@ extension OpenAI {
         }
     }
     
-    func performSteamingRequest<ResultType: Codable>(request: any URLRequestBuildable, onResult: @escaping (Result<ResultType, Error>) -> Void, completion: ((Error?) -> Void)?) {
+    func performStreamingRequest<ResultType: Codable>(request: any URLRequestBuildable, onResult: @escaping (Result<ResultType, Error>) -> Void, completion: ((Error?) -> Void)?) {
         do {
             let request = try request.build(token: configuration.token, 
                                             organizationIdentifier: configuration.organizationIdentifier,
@@ -189,25 +227,13 @@ extension OpenAI {
             
             let task = session.dataTask(with: request) { data, _, error in
                 if let error = error {
-                    completion(.failure(error))
-                    return
+                    return completion(.failure(error))
                 }
                 guard let data = data else {
-                    completion(.failure(OpenAIError.emptyData))
-                    return
+                    return completion(.failure(OpenAIError.emptyData))
                 }
                 
-                completion(.success(AudioSpeechResult(audioData: data)))
-                let apiError: Error? = nil
-                
-                if let apiError = apiError {
-                    do {
-                        let decoded = try JSONDecoder().decode(APIErrorResponse.self, from: data)
-                        completion(.failure(decoded))
-                    } catch {
-                        completion(.failure(apiError))
-                    }
-                }
+                completion(.success(AudioSpeechResult(audio: data)))
             }
             task.resume()
         } catch {
@@ -218,18 +244,67 @@ extension OpenAI {
 
 extension OpenAI {
     
-    func buildURL(path: String) -> URL {
+    func buildURL(path: String, after: String? = nil) -> URL {
         var components = URLComponents()
         components.scheme = "https"
         components.host = configuration.host
         components.path = path
+        if let after {
+            components.queryItems = [URLQueryItem(name: "after", value: after)]
+        }
+        return components.url!
+    }
+
+    func buildRunsURL(path: String, threadId: String, before: String? = nil) -> URL {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = configuration.host
+        components.path = path.replacingOccurrences(of: "THREAD_ID", with: threadId)
+        if let before {
+            components.queryItems = [URLQueryItem(name: "before", value: before)]
+        }
+        return components.url!
+    }
+
+    func buildRunRetrieveURL(path: String, threadId: String, runId: String, before: String? = nil) -> URL {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = configuration.host
+        components.path = path.replacingOccurrences(of: "THREAD_ID", with: threadId)
+                              .replacingOccurrences(of: "RUN_ID", with: runId)
+        if let before {
+            components.queryItems = [URLQueryItem(name: "before", value: before)]
+        }
+        return components.url!
+    }
+
+    func buildAssistantURL(path: String, assistantId: String) -> URL {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = configuration.host
+        components.path = path.replacingOccurrences(of: "ASST_ID", with: assistantId)
+
         return components.url!
     }
 }
 
 typealias APIPath = String
 extension APIPath {
-    
+    // 1106
+    static let assistants = "/v1/assistants"
+    static let assistantsModify = "/v1/assistants/ASST_ID"
+    static let threads = "/v1/threads"
+    static let threadRun = "/v1/threads/runs"
+    static let runs = "/v1/threads/THREAD_ID/runs"
+    static let runRetrieve = "/v1/threads/THREAD_ID/runs/RUN_ID"
+    static let runRetrieveSteps = "/v1/threads/THREAD_ID/runs/RUN_ID/steps"
+    static func runSubmitToolOutputs(threadId: String, runId: String) -> String {
+        "/v1/threads/\(threadId)/runs/\(runId)/submit_tool_outputs"
+    }
+    static let threadsMessages = "/v1/threads/THREAD_ID/messages"
+    static let files = "/v1/files"
+    // 1106 end
+
     static let completions = "/v1/completions"
     static let embeddings = "/v1/embeddings"
     static let chats = "/v1/chat/completions"
